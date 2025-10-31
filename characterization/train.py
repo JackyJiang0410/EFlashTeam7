@@ -176,6 +176,106 @@ class SensorSpatialDataset(torch.utils.data.Dataset):
             return y * torch.tensor(self.y_std, device=y.device) + torch.tensor(self.y_mean, device=y.device)
         return y * self.y_std + self.y_mean
 
+
+class NewFormatSpatialDataset(torch.utils.data.Dataset):
+    """
+    Dataset for new format where each CSV contains:
+    timestamp,position,x_pos,y_pos,fx,fy,fz,tx,ty,tz,mag0_x,mag0_y,mag0_z,...,mag4_z
+    
+    This adapter loads multiple position files and creates a localization dataset.
+    """
+    def __init__(
+        self,
+        data_dir: str,
+        pattern: str = "position_*.csv",
+        x_mean=None, x_std=None,
+        y_mean=None, y_std=None,
+        normalize_x: bool = True,
+        normalize_y: bool = True,
+        z_value: float = 0.0,  # Fixed z for 2D grid, or use from contact detection
+    ):
+        from pathlib import Path
+        import glob
+        
+        data_path = Path(data_dir)
+        csv_files = sorted(glob.glob(str(data_path / pattern)))
+        
+        if not csv_files:
+            raise ValueError(f"No files matching {pattern} found in {data_dir}")
+        
+        all_sensors, all_positions = [], []
+        
+        for csv_file in csv_files:
+            with open(csv_file, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        # Extract position (x_pos, y_pos)
+                        x_pos = float(row['x_pos'])
+                        y_pos = float(row['y_pos'])
+                        
+                        # Extract magnetometer readings (columns 10-24, after tz)
+                        mag_readings = [
+                            float(row['mag0_x']), float(row['mag0_y']), float(row['mag0_z']),
+                            float(row['mag1_x']), float(row['mag1_y']), float(row['mag1_z']),
+                            float(row['mag2_x']), float(row['mag2_y']), float(row['mag2_z']),
+                            float(row['mag3_x']), float(row['mag3_y']), float(row['mag3_z']),
+                            float(row['mag4_x']), float(row['mag4_y']), float(row['mag4_z']),
+                        ]
+                        
+                        # Skip if all magnetometer readings are zero (sensor not active)
+                        if all(abs(m) < 1e-6 for m in mag_readings):
+                            continue
+                        
+                        all_sensors.append(mag_readings)
+                        all_positions.append([x_pos, y_pos, z_value])
+                    except (KeyError, ValueError) as e:
+                        # Skip malformed rows
+                        continue
+        
+        if len(all_sensors) == 0:
+            raise ValueError(f"No valid data found in {data_dir}")
+        
+        self.X = np.asarray(all_sensors, dtype=np.float32)
+        self.Y = np.asarray(all_positions, dtype=np.float32)
+        
+        print(f"Loaded {len(self.X)} samples from {len(csv_files)} files in {data_dir}")
+        
+        self.normalize_x = normalize_x
+        self.normalize_y = normalize_y
+        
+        if self.normalize_x:
+            if x_mean is None or x_std is None:
+                x_mean = self.X.mean(axis=0)
+                x_std = self.X.std(axis=0)
+            x_std = np.where(x_std < 1e-8, 1.0, x_std)
+            self.x_mean = x_mean.astype(np.float32)
+            self.x_std = x_std.astype(np.float32)
+            self.X = (self.X - self.x_mean) / self.x_std
+        else:
+            self.x_mean = np.zeros(self.X.shape[1], dtype=np.float32)
+            self.x_std = np.ones(self.X.shape[1], dtype=np.float32)
+
+        if self.normalize_y:
+            if y_mean is None or y_std is None:
+                y_mean = self.Y.mean(axis=0)
+                y_std = self.Y.std(axis=0)
+            y_std = np.where(y_std < 1e-8, 1.0, y_std)
+            self.y_mean = y_mean.astype(np.float32)
+            self.y_std = y_std.astype(np.float32)
+            self.Y = (self.Y - self.y_mean) / self.y_std
+        else:
+            self.y_mean = np.zeros(3, dtype=np.float32)
+            self.y_std = np.ones(3, dtype=np.float32)
+
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx): return self.X[idx], self.Y[idx]
+
+    def unnormalize_y(self, y):
+        if isinstance(y, torch.Tensor):
+            return y * torch.tensor(self.y_std, device=y.device) + torch.tensor(self.y_mean, device=y.device)
+        return y * self.y_std + self.y_mean
+
 def fit(
     dataset_full,
     out_dim: int,
@@ -203,6 +303,7 @@ def fit(
     y_std = np.where(y_std < 1e-8, 1.0, y_std)
 
     if out_dim == 1:
+        # Force regression (DEPRECATED - should not reach here)
         dataset = SensorForceDataset(
             states_csv=dataset_full._states_csv,
             sensor_csv=dataset_full._sensor_csv,
@@ -212,14 +313,27 @@ def fit(
             normalize_x=True, normalize_y=True,
         )
     else:
-        dataset = SensorSpatialDataset(
-            states_csv=dataset_full._states_csv,
-            sensor_csv=dataset_full._sensor_csv,
-            z_thresh=dataset_full._z_thresh,
-            x_mean=x_mean, x_std=x_std,
-            y_mean=y_mean, y_std=y_std,
-            normalize_x=True, normalize_y=True,
-        )
+        # Localization (spatial)
+        if hasattr(dataset_full, '_data_dir'):
+            # NewFormatSpatialDataset
+            dataset = NewFormatSpatialDataset(
+                data_dir=dataset_full._data_dir,
+                pattern=dataset_full._pattern,
+                z_value=dataset_full._z_value,
+                x_mean=x_mean, x_std=x_std,
+                y_mean=y_mean, y_std=y_std,
+                normalize_x=True, normalize_y=True,
+            )
+        else:
+            # Legacy SensorSpatialDataset
+            dataset = SensorSpatialDataset(
+                states_csv=dataset_full._states_csv,
+                sensor_csv=dataset_full._sensor_csv,
+                z_thresh=dataset_full._z_thresh,
+                x_mean=x_mean, x_std=x_std,
+                y_mean=y_mean, y_std=y_std,
+                normalize_x=True, normalize_y=True,
+            )
 
     train_loader = torch.utils.data.DataLoader(
         torch.utils.data.Subset(dataset, train_idx), batch_size=batch_size, shuffle=True
@@ -291,22 +405,66 @@ def fit(
     return model, (x_mean, x_std, y_mean, y_std)
 
 def main():
-    parser = argparse.ArgumentParser(description="eFlesh characterization training")
-    parser.add_argument("--mode", choices=["spatial", "normal", "shear"], required=True)
-    parser.add_argument("--folder", type=str, required=True, help="Path to a dataset folder in characterization/datasets/")
+    parser = argparse.ArgumentParser(description="eFlesh characterization training - LOCALIZATION ONLY")
+    parser.add_argument("--mode", choices=["spatial", "newformat"], default="newformat",
+                        help="Dataset format: 'spatial' (legacy) or 'newformat' (Data/local_sin_3*3/)")
+    parser.add_argument("--folder", type=str, required=True, 
+                        help="Path to dataset: for 'spatial', a probe folder; for 'newformat', directory with position_*.csv")
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--target_col", type=int, default=4, help="Force column in states.csv (use if normal/shear columns differ)")
-    parser.add_argument("--z_thresh", type=float, default=145.1)
+    parser.add_argument("--z_thresh", type=float, default=145.1, help="Z threshold for legacy spatial mode")
+    parser.add_argument("--z_value", type=float, default=0.0, help="Fixed Z value for newformat (2D grid)")
+    parser.add_argument("--pattern", type=str, default="position_*.csv", help="File pattern for newformat mode")
     parser.add_argument("--seed", type=int, default=0)
+    
+    # Force regression modes are DISABLED by default (moved to unused/)
+    parser.add_argument("--enable-force-regression", action="store_true", 
+                        help="[DEPRECATED] Enable force regression modes (normal/shear). Data moved to unused/")
+    parser.add_argument("--force-mode", choices=["normal", "shear"], 
+                        help="[DEPRECATED] Force regression mode (requires --enable-force-regression)")
+    parser.add_argument("--target_col", type=int, default=4, 
+                        help="[DEPRECATED] Force column in states.csv")
+    
     args = parser.parse_args()
+    
+    # Guard force regression modes
+    if args.enable_force_regression:
+        if not args.force_mode:
+            print("ERROR: --force-mode required when --enable-force-regression is set")
+            print("Force regression datasets have been moved to unused/characterization/datasets/")
+            return
+        print("WARNING: Force regression is deprecated. Datasets moved to unused/")
+        print("Use legacy code from unused/experiments/ if you need this functionality.")
+        return
 
-    states_csv = os.path.join(args.folder, "states.csv")
-    sensor_csv = os.path.join(args.folder, "sensor_post_baselines.csv")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if args.mode == "spatial":
+    print(f"Using device: {device}")
+    
+    # LOCALIZATION-ONLY MODES
+    if args.mode == "newformat":
+        # New format: Data/local_sin_3*3/ with position_*.csv files
+        full = NewFormatSpatialDataset(
+            data_dir=args.folder,
+            pattern=args.pattern,
+            z_value=args.z_value,
+            normalize_x=False,
+            normalize_y=False,
+        )
+        full._data_dir = args.folder
+        full._pattern = args.pattern
+        full._z_value = args.z_value
+        out_dim = 3
+        
+    elif args.mode == "spatial":
+        # Legacy format: characterization/datasets/spatial_resolution/
+        states_csv = os.path.join(args.folder, "states.csv")
+        sensor_csv = os.path.join(args.folder, "sensor_post_baselines.csv")
+        
+        if not os.path.exists(states_csv) or not os.path.exists(sensor_csv):
+            print(f"ERROR: Legacy spatial mode requires states.csv and sensor_post_baselines.csv in {args.folder}")
+            return
+            
         full = SensorSpatialDataset(
             states_csv, sensor_csv, z_thresh=args.z_thresh,
             normalize_x=False, normalize_y=False,
@@ -315,15 +473,14 @@ def main():
         full._sensor_csv = sensor_csv
         full._z_thresh = args.z_thresh
         out_dim = 3
-    else:
-        full = SensorForceDataset(
-            states_csv, sensor_csv, target_col=args.target_col,
-            normalize_x=False, normalize_y=False,
-        )
-        full._states_csv = states_csv
-        full._sensor_csv = sensor_csv
-        full._target_col = args.target_col
-        out_dim = 1
+
+    print(f"\n{'='*60}")
+    print(f"Starting LOCALIZATION training")
+    print(f"Mode: {args.mode}")
+    print(f"Dataset: {args.folder}")
+    print(f"Samples: {len(full.X)}")
+    print(f"Input dim: {full.X.shape[1]}, Output dim: {out_dim}")
+    print(f"{'='*60}\n")
 
     model, stats = fit(
         dataset_full=full,
@@ -335,7 +492,11 @@ def main():
         seed=args.seed,
     )
 
-    os.makedirs(os.path.join(args.folder, "artifacts"), exist_ok=True)
+    # Save checkpoint
+    artifacts_dir = os.path.join(args.folder, "artifacts")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    
+    checkpoint_path = os.path.join(artifacts_dir, f"eflesh_localization_{args.mode}_mlp128.pt")
     torch.save(
         {
             "state_dict": model.state_dict(),
@@ -346,8 +507,11 @@ def main():
             "y_mean": stats[2],
             "y_std": stats[3],
         },
-        os.path.join(args.folder, "artifacts", f"eflesh_{args.mode}_mlp128.pt"),
+        checkpoint_path,
     )
+    print(f"\n{'='*60}")
+    print(f"Model saved to: {checkpoint_path}")
+    print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()

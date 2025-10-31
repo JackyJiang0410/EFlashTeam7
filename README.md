@@ -22,11 +22,99 @@
 #####
 
 ## Getting Started
-```
+```bash
 git clone --recurse-submodules https://github.com/notvenky/eFlesh.git
 cd eFlesh
 conda env create -f env.yml
+conda activate eflesh
 ```
+
+---
+
+## Quickstart (Localization Only)
+
+> **Note:** This repository has been adapted for touch localization. Force regression and slip detection experiments have been moved to `unused/` for reference. See `localization_only.md` for full migration details.
+
+### Train Localization Model
+
+Train a localization model on your data in `Data/local_sin_3*3/`:
+
+```bash
+# Basic training (200 epochs)
+python characterization/train.py --folder Data/local_sin_3*3/ --epochs 200
+
+# With custom parameters
+python characterization/train.py \
+    --folder Data/local_sin_3*3/ \
+    --epochs 500 \
+    --batch_size 64 \
+    --lr 1e-3
+```
+
+**Expected Output:**
+```
+Loaded 1998 samples from 9 files in Data/local_sin_3*3/
+Starting LOCALIZATION training
+Mode: newformat
+Samples: 1998
+Input dim: 15, Output dim: 3
+============================================================
+
+Epoch 50/200: RMSE_x: 2.34mm, RMSE_y: 1.87mm, RMSE_z: 0.00mm, Net: 3.01mm
+...
+Model saved to: Data/local_sin_3*3/artifacts/eflesh_localization_newformat_mlp128.pt
+```
+
+### Data Format
+
+Your CSV files should have the following structure:
+
+```csv
+timestamp,position,x_pos,y_pos,fx,fy,fz,tx,ty,tz,mag0_x,mag0_y,mag0_z,mag1_x,...,mag4_z
+```
+
+- **`x_pos`, `y_pos`**: Ground truth positions (target outputs)
+- **`mag0_x` through `mag4_z`**: 15 magnetometer readings (model inputs)
+- **`fx`, `fy`, `fz`, `tx`, `ty`, `tz`**: Force/torque data (ignored for localization)
+
+### Load Trained Model
+
+```python
+import torch
+from characterization.model import MLP
+
+# Load checkpoint
+checkpoint = torch.load("Data/local_sin_3*3/artifacts/eflesh_localization_newformat_mlp128.pt")
+model = MLP(in_dim=15, out_dim=3, hidden=128)
+model.load_state_dict(checkpoint["state_dict"])
+model.eval()
+
+# Predict position from sensor readings
+sensor_data = torch.tensor([...], dtype=torch.float32)  # 15 magnetometer values
+x_norm = (sensor_data - checkpoint["x_mean"]) / checkpoint["x_std"]
+y_norm = model(x_norm)
+position = y_norm.numpy() * checkpoint["y_std"] + checkpoint["y_mean"]  # (x, y, z)
+```
+
+### Legacy Modes
+
+To use the original spatial resolution datasets:
+
+```bash
+python characterization/train.py \
+    --mode spatial \
+    --folder characterization/datasets/spatial_resolution/20250316_155729_probe/
+```
+
+### Deprecated Features
+
+The following features have been moved to `unused/` and are no longer active:
+- **Force regression** (`normal_force/`, `shear_force/` datasets) → `unused/characterization/datasets/`
+- **Slip detection** (LSTM-based classifier) → `unused/experiments/slip_detection/`
+
+See `localization_only.md` for details on the migration and how to re-enable these features if needed.
+
+---
 
 ## Sensor Design
 
