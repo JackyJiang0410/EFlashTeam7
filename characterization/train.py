@@ -284,6 +284,7 @@ def fit(
     lr: float,
     device: torch.device,
     seed: int = 0,
+    test_split: float = 0.15,  # Add test split ratio
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -291,8 +292,15 @@ def fit(
     n = len(dataset_full.X)
     idxs = np.arange(n)
     np.random.shuffle(idxs)
-    split = int(0.8 * n)
-    train_idx, val_idx = idxs[:split], idxs[split:]
+    
+    # Split into train/val/test: train gets remaining after val+test
+    val_split = int((1.0 - test_split) * 0.2 * n)  # 20% of remaining becomes val
+    train_split = int((1.0 - test_split) * 0.8 * n)  # 80% of remaining becomes train
+    train_idx = idxs[:train_split]
+    val_idx = idxs[train_split:train_split + val_split]
+    test_idx = idxs[train_split + val_split:]
+
+    print(f"Data splits: Train={len(train_idx)}, Val={len(val_idx)}, Test={len(test_idx)}")
 
     x_mean = dataset_full.X[train_idx].mean(axis=0)
     x_std = dataset_full.X[train_idx].std(axis=0)
@@ -341,15 +349,27 @@ def fit(
     val_loader = torch.utils.data.DataLoader(
         torch.utils.data.Subset(dataset, val_idx), batch_size=batch_size, shuffle=False
     )
+    test_loader = torch.utils.data.DataLoader(
+        torch.utils.data.Subset(dataset, test_idx), batch_size=batch_size, shuffle=False
+    )
 
     model = MLP(in_dim=dataset.X.shape[1], out_dim=out_dim).to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
+    # Store final metrics
+    final_train_mse = None
+    final_val_mse = None
+    final_train_rmse = None
+    final_val_rmse = None
+    final_train_metrics = None
+    final_val_metrics = None
+
     pbar = tqdm(range(1, epochs + 1), desc="Training", ncols=150)
     for e in pbar:
         model.train()
         train_loss_sum, train_count = 0.0, 0
+        train_all_pred, train_all_true = [], []
         for Xb, Yb in train_loader:
             Xb = Xb.float().to(device)
             Yb = Yb.float().to(device)
@@ -360,6 +380,8 @@ def fit(
             opt.step()
             train_loss_sum += loss.item() * Xb.size(0)
             train_count += Xb.size(0)
+            train_all_pred.append(pred.detach().cpu())
+            train_all_true.append(Yb.cpu())
         train_mse = train_loss_sum / max(1, train_count)
 
         model.eval()
@@ -391,6 +413,9 @@ def fit(
                 'Val MSE': f'{val_mse:.4f}',
                 'RMSE': f'{rmse:.3f}g'
             })
+            final_train_mse = train_mse
+            final_val_mse = val_mse
+            final_val_rmse = rmse
         else:
             per_axis_rmse = torch.sqrt(torch.mean(d ** 2, dim=0))
             euclid_rmse = torch.sqrt(torch.mean(torch.sum(d ** 2, dim=1)))
@@ -401,6 +426,110 @@ def fit(
                 'RMSE_z': f'{rz:.2f}mm',
                 'Net': f'{euclid_rmse:.2f}mm'
             })
+            final_train_mse = train_mse
+            final_val_mse = val_mse
+            final_val_metrics = {
+                'rmse_x': rx,
+                'rmse_y': ry,
+                'rmse_z': rz,
+                'rmse_euclid': euclid_rmse.item()
+            }
+        
+        # Calculate training RMSE for final epoch
+        if e == epochs:
+            train_pred_cat = torch.cat(train_all_pred, dim=0)
+            train_true_cat = torch.cat(train_all_true, dim=0)
+            train_pred_real = torch.from_numpy(dataset.unnormalize_y(train_pred_cat.numpy()))
+            train_true_real = torch.from_numpy(dataset.unnormalize_y(train_true_cat.numpy()))
+            train_d = train_pred_real - train_true_real
+            
+            if out_dim == 1:
+                final_train_rmse = torch.sqrt(torch.mean(train_d[:, 0] ** 2)).item()
+            else:
+                train_per_axis_rmse = torch.sqrt(torch.mean(train_d ** 2, dim=0))
+                train_euclid_rmse = torch.sqrt(torch.mean(torch.sum(train_d ** 2, dim=1)))
+                final_train_metrics = {
+                    'rmse_x': train_per_axis_rmse[0].item(),
+                    'rmse_y': train_per_axis_rmse[1].item(),
+                    'rmse_z': train_per_axis_rmse[2].item(),
+                    'rmse_euclid': train_euclid_rmse.item()
+                }
+
+    # Evaluate on test set
+    print("\n" + "="*60)
+    print("Evaluating on TEST set...")
+    print("="*60)
+    model.eval()
+    test_loss_sum, test_count = 0.0, 0
+    test_all_pred, test_all_true = [], []
+    with torch.no_grad():
+        for Xb, Yb in test_loader:
+            Xb = Xb.float().to(device)
+            Yb = Yb.float().to(device)
+            pred = model(Xb)
+            loss = criterion(pred, Yb)
+            test_loss_sum += loss.item() * Xb.size(0)
+            test_count += Xb.size(0)
+            test_all_pred.append(pred.cpu())
+            test_all_true.append(Yb.cpu())
+    
+    test_mse = test_loss_sum / max(1, test_count)
+    test_pred = torch.cat(test_all_pred, dim=0)
+    test_true = torch.cat(test_all_true, dim=0)
+    test_pred_real = torch.from_numpy(dataset.unnormalize_y(test_pred.numpy()))
+    test_true_real = torch.from_numpy(dataset.unnormalize_y(test_true.numpy()))
+    test_d = test_pred_real - test_true_real
+
+    if out_dim == 1:
+        test_rmse = torch.sqrt(torch.mean(test_d[:, 0] ** 2)).item()
+    else:
+        test_per_axis_rmse = torch.sqrt(torch.mean(test_d ** 2, dim=0))
+        test_euclid_rmse = torch.sqrt(torch.mean(torch.sum(test_d ** 2, dim=1)))
+        test_metrics = {
+            'rmse_x': test_per_axis_rmse[0].item(),
+            'rmse_y': test_per_axis_rmse[1].item(),
+            'rmse_z': test_per_axis_rmse[2].item(),
+            'rmse_euclid': test_euclid_rmse.item()
+        }
+
+    # Print comprehensive results summary
+    print("\n" + "="*60)
+    print("FINAL TRAINING RESULTS SUMMARY")
+    print("="*60)
+    
+    if out_dim == 1:
+        print(f"\nTraining Set:")
+        print(f"  MSE:  {final_train_mse:.6f}")
+        print(f"  RMSE: {final_train_rmse:.3f} g")
+        print(f"\nValidation Set:")
+        print(f"  MSE:  {final_val_mse:.6f}")
+        print(f"  RMSE: {final_val_rmse:.3f} g")
+        print(f"\nTest Set:")
+        print(f"  MSE:  {test_mse:.6f}")
+        print(f"  RMSE: {test_rmse:.3f} g")
+    else:
+        print(f"\nTraining Set:")
+        print(f"  MSE:       {final_train_mse:.6f}")
+        print(f"  RMSE (X):  {final_train_metrics['rmse_x']:.2f} mm")
+        print(f"  RMSE (Y):  {final_train_metrics['rmse_y']:.2f} mm")
+        print(f"  RMSE (Z):  {final_train_metrics['rmse_z']:.2f} mm")
+        print(f"  RMSE (3D): {final_train_metrics['rmse_euclid']:.2f} mm")
+        
+        print(f"\nValidation Set:")
+        print(f"  MSE:       {final_val_mse:.6f}")
+        print(f"  RMSE (X):  {final_val_metrics['rmse_x']:.2f} mm")
+        print(f"  RMSE (Y):  {final_val_metrics['rmse_y']:.2f} mm")
+        print(f"  RMSE (Z):  {final_val_metrics['rmse_z']:.2f} mm")
+        print(f"  RMSE (3D): {final_val_metrics['rmse_euclid']:.2f} mm")
+        
+        print(f"\nTest Set:")
+        print(f"  MSE:       {test_mse:.6f}")
+        print(f"  RMSE (X):  {test_metrics['rmse_x']:.2f} mm")
+        print(f"  RMSE (Y):  {test_metrics['rmse_y']:.2f} mm")
+        print(f"  RMSE (Z):  {test_metrics['rmse_z']:.2f} mm")
+        print(f"  RMSE (3D): {test_metrics['rmse_euclid']:.2f} mm")
+    
+    print("="*60 + "\n")
 
     return model, (x_mean, x_std, y_mean, y_std)
 
