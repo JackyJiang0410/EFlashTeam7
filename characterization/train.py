@@ -1,6 +1,9 @@
 import argparse
-import os
 import csv
+import math
+import os
+from typing import List, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -276,6 +279,191 @@ class NewFormatSpatialDataset(torch.utils.data.Dataset):
             return y * torch.tensor(self.y_std, device=y.device) + torch.tensor(self.y_mean, device=y.device)
         return y * self.y_std + self.y_mean
 
+
+class MultiTouchSpatialDataset(torch.utils.data.Dataset):
+    """
+    Dataset for multi-touch localization where each CSV row contains multiple touch
+    position pairs and magnetometer readings.
+    """
+
+    def __init__(
+        self,
+        data_dir: str,
+        pattern: str = "multi_touch_*.csv",
+        max_touches: int | None = None,
+        drop_zero_rows: bool = True,
+        x_mean=None,
+        x_std=None,
+        y_mean=None,
+        y_std=None,
+        normalize_x: bool = True,
+        normalize_y: bool = True,
+    ):
+        from pathlib import Path
+        import glob
+
+        data_path = Path(data_dir)
+        csv_files = sorted(glob.glob(str(data_path / pattern)))
+
+        if not csv_files:
+            raise ValueError(f"No files matching {pattern} found in {data_dir}")
+
+        feature_names = None
+        pos_pairs: List[Tuple[str, str]] = []
+        mag_cols: List[str] = []
+        # We read normal force for filtering only; it is not part of the input feature vector.
+        force_key = "fz"
+
+        def _init_columns(fieldnames):
+            nonlocal feature_names, pos_pairs, mag_cols
+            if feature_names is not None:
+                return
+
+            feature_names = fieldnames
+
+            if force_key not in fieldnames:
+                raise ValueError(
+                    f"'fz' column required in multi-touch dataset for contact filtering (missing in {fieldnames})"
+                )
+
+            touch_ids = []
+            for name in fieldnames:
+                if not name.startswith("pos") or "_" not in name:
+                    continue
+                prefix, axis = name.split("_", 1)
+                if axis not in {"x", "y"}:
+                    continue
+                suffix = prefix[3:]
+                if not suffix.isdigit():
+                    continue
+                touch_ids.append(int(suffix))
+
+            touch_ids = sorted(set(touch_ids))
+            if not touch_ids:
+                raise ValueError(
+                    f"Could not find any pos*_x/pos*_y columns in header: {fieldnames}"
+                )
+
+            if max_touches is not None:
+                touch_ids = touch_ids[:max_touches]
+
+            for tid in touch_ids:
+                x_key = f"pos{tid}_x"
+                y_key = f"pos{tid}_y"
+                if x_key in fieldnames and y_key in fieldnames:
+                    pos_pairs.append((x_key, y_key))
+
+            if not pos_pairs:
+                raise ValueError(
+                    "Touch position columns detected but pairs could not be formed."
+                )
+
+            mag_cols.extend([c for c in fieldnames if c.startswith("mag")])
+            if not mag_cols:
+                raise ValueError("No magnetometer columns (mag*_*) found in dataset.")
+            if len(mag_cols) % 3 != 0:
+                raise ValueError(
+                    f"Expected magnetometer axes in multiples of 3, got {len(mag_cols)}"
+                )
+
+        X_rows, Y_rows = [], []
+
+        for csv_file in csv_files:
+            with open(csv_file, "r") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None:
+                    continue
+                _init_columns(reader.fieldnames)
+
+                for row in reader:
+                    try:
+                        fz_val = float(row[force_key])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+
+                    # Skip samples with low normal force (< 1 N) as contact is unreliable
+                    if fz_val < 1.0:
+                        continue
+
+                    try:
+                        mags = [float(row[col]) for col in mag_cols]
+                    except (KeyError, TypeError, ValueError):
+                        continue
+
+                    if drop_zero_rows and all(abs(m) < 1e-6 for m in mags):
+                        continue
+
+                    try:
+                        positions = []
+                        for x_key, y_key in pos_pairs:
+                            positions.extend([float(row[x_key]), float(row[y_key])])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+
+                    X_rows.append(np.asarray(mags, dtype=np.float32))
+                    Y_rows.append(np.asarray(positions, dtype=np.float32))
+
+        if not X_rows:
+            raise ValueError(
+                f"No usable samples found in {len(csv_files)} files under {data_dir}"
+            )
+
+        self.X = np.vstack(X_rows)
+        self.Y = np.vstack(Y_rows)
+
+        self.normalize_x = normalize_x
+        self.normalize_y = normalize_y
+
+        if self.normalize_x:
+            if x_mean is None or x_std is None:
+                x_mean = self.X.mean(axis=0)
+                x_std = self.X.std(axis=0)
+            x_std = np.where(x_std < 1e-8, 1.0, x_std)
+            self.x_mean = x_mean.astype(np.float32)
+            self.x_std = x_std.astype(np.float32)
+            self.X = (self.X - self.x_mean) / self.x_std
+        else:
+            self.x_mean = np.zeros(self.X.shape[1], dtype=np.float32)
+            self.x_std = np.ones(self.X.shape[1], dtype=np.float32)
+
+        if self.normalize_y:
+            if y_mean is None or y_std is None:
+                y_mean = self.Y.mean(axis=0)
+                y_std = self.Y.std(axis=0)
+            y_std = np.where(y_std < 1e-8, 1.0, y_std)
+            self.y_mean = y_mean.astype(np.float32)
+            self.y_std = y_std.astype(np.float32)
+            self.Y = (self.Y - self.y_mean) / self.y_std
+        else:
+            self.y_mean = np.zeros(self.Y.shape[1], dtype=np.float32)
+            self.y_std = np.ones(self.Y.shape[1], dtype=np.float32)
+
+        self.touch_pairs = pos_pairs
+        self.mag_cols = mag_cols
+        self.output_dim = self.Y.shape[1]
+
+        # Metadata for re-instantiation within fit()
+        self._dataset_type = "multi_touch"
+        self._data_dir = data_dir
+        self._pattern = pattern
+        self._max_touches = max_touches
+        self._drop_zero_rows = drop_zero_rows
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+    def unnormalize_y(self, y):
+        if isinstance(y, torch.Tensor):
+            return (
+                y * torch.tensor(self.y_std, device=y.device)
+                + torch.tensor(self.y_mean, device=y.device)
+            )
+        return y * self.y_std + self.y_mean
+
+
 def fit(
     dataset_full,
     out_dim: int,
@@ -310,6 +498,8 @@ def fit(
     y_std = dataset_full.Y[train_idx].std(axis=0)
     y_std = np.where(y_std < 1e-8, 1.0, y_std)
 
+    dataset_type = getattr(dataset_full, "_dataset_type", None)
+
     if out_dim == 1:
         # Force regression (DEPRECATED - should not reach here)
         dataset = SensorForceDataset(
@@ -322,8 +512,17 @@ def fit(
         )
     else:
         # Localization (spatial)
-        if hasattr(dataset_full, '_data_dir'):
-            # NewFormatSpatialDataset
+        if dataset_type == "multi_touch":
+            dataset = MultiTouchSpatialDataset(
+                data_dir=dataset_full._data_dir,
+                pattern=dataset_full._pattern,
+                max_touches=dataset_full._max_touches,
+                drop_zero_rows=dataset_full._drop_zero_rows,
+                x_mean=x_mean, x_std=x_std,
+                y_mean=y_mean, y_std=y_std,
+                normalize_x=True, normalize_y=True,
+            )
+        elif dataset_type == "newformat":
             dataset = NewFormatSpatialDataset(
                 data_dir=dataset_full._data_dir,
                 pattern=dataset_full._pattern,
@@ -332,8 +531,7 @@ def fit(
                 y_mean=y_mean, y_std=y_std,
                 normalize_x=True, normalize_y=True,
             )
-        else:
-            # Legacy SensorSpatialDataset
+        elif dataset_type in (None, "spatial"):
             dataset = SensorSpatialDataset(
                 states_csv=dataset_full._states_csv,
                 sensor_csv=dataset_full._sensor_csv,
@@ -342,6 +540,8 @@ def fit(
                 y_mean=y_mean, y_std=y_std,
                 normalize_x=True, normalize_y=True,
             )
+        else:
+            raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
     train_loader = torch.utils.data.DataLoader(
         torch.utils.data.Subset(dataset, train_idx), batch_size=batch_size, shuffle=True
@@ -364,6 +564,8 @@ def fit(
     final_val_rmse = None
     final_train_metrics = None
     final_val_metrics = None
+    is_multi_touch = dataset_type == "multi_touch"
+    touch_pairs = dataset.touch_pairs if is_multi_touch else []
 
     pbar = tqdm(range(1, epochs + 1), desc="Training", ncols=150)
     for e in pbar:
@@ -416,15 +618,41 @@ def fit(
             final_train_mse = train_mse
             final_val_mse = val_mse
             final_val_rmse = rmse
+        elif is_multi_touch:
+            diff_mt = d.view(d.size(0), len(touch_pairs), 2)
+            per_coord_rmse = {}
+            per_coord_mse = {}
+            for idx, (x_key, y_key) in enumerate(touch_pairs):
+                dx = diff_mt[:, idx, 0]
+                dy = diff_mt[:, idx, 1]
+                per_coord_rmse[x_key] = torch.sqrt(torch.mean(dx ** 2)).item()
+                per_coord_rmse[y_key] = torch.sqrt(torch.mean(dy ** 2)).item()
+                per_coord_mse[x_key] = torch.mean(dx ** 2).item()
+                per_coord_mse[y_key] = torch.mean(dy ** 2).item()
+            mse_all = torch.mean(torch.sum(diff_mt ** 2, dim=2)).item()
+            rmse_all = math.sqrt(mse_all)
+            postfix = {}
+            for coord_key in per_coord_rmse:
+                postfix[f'RMSE_{coord_key}'] = f'{per_coord_rmse[coord_key]:.2f} grid'
+            postfix['RMSE_all'] = f'{rmse_all:.2f} grid'
+            pbar.set_postfix(postfix)
+            final_train_mse = train_mse
+            final_val_mse = val_mse
+            final_val_metrics = {
+                'per_coord_rmse': per_coord_rmse,
+                'per_coord_mse': per_coord_mse,
+                'rmse_all': rmse_all,
+                'mse_all': mse_all,
+            }
         else:
             per_axis_rmse = torch.sqrt(torch.mean(d ** 2, dim=0))
             euclid_rmse = torch.sqrt(torch.mean(torch.sum(d ** 2, dim=1)))
             rx, ry, rz = (per_axis_rmse[0].item(), per_axis_rmse[1].item(), per_axis_rmse[2].item())
             pbar.set_postfix({
-                'RMSE_x': f'{rx:.2f}mm',
-                'RMSE_y': f'{ry:.2f}mm', 
-                'RMSE_z': f'{rz:.2f}mm',
-                'Net': f'{euclid_rmse:.2f}mm'
+                'RMSE_x': f'{rx:.2f} grid',
+                'RMSE_y': f'{ry:.2f} grid', 
+                'RMSE_z': f'{rz:.2f} grid',
+                'Net': f'{euclid_rmse:.2f} grid'
             })
             final_train_mse = train_mse
             final_val_mse = val_mse
@@ -445,6 +673,25 @@ def fit(
             
             if out_dim == 1:
                 final_train_rmse = torch.sqrt(torch.mean(train_d[:, 0] ** 2)).item()
+            elif is_multi_touch:
+                diff_mt = train_d.view(train_d.size(0), len(touch_pairs), 2)
+                per_coord_rmse = {}
+                per_coord_mse = {}
+                for idx, (x_key, y_key) in enumerate(touch_pairs):
+                    dx = diff_mt[:, idx, 0]
+                    dy = diff_mt[:, idx, 1]
+                    per_coord_rmse[x_key] = torch.sqrt(torch.mean(dx ** 2)).item()
+                    per_coord_rmse[y_key] = torch.sqrt(torch.mean(dy ** 2)).item()
+                    per_coord_mse[x_key] = torch.mean(dx ** 2).item()
+                    per_coord_mse[y_key] = torch.mean(dy ** 2).item()
+                mse_all = torch.mean(torch.sum(diff_mt ** 2, dim=2)).item()
+                rmse_all = math.sqrt(mse_all)
+                final_train_metrics = {
+                    'per_coord_rmse': per_coord_rmse,
+                    'per_coord_mse': per_coord_mse,
+                    'rmse_all': rmse_all,
+                    'mse_all': mse_all,
+                }
             else:
                 train_per_axis_rmse = torch.sqrt(torch.mean(train_d ** 2, dim=0))
                 train_euclid_rmse = torch.sqrt(torch.mean(torch.sum(train_d ** 2, dim=1)))
@@ -482,6 +729,25 @@ def fit(
 
     if out_dim == 1:
         test_rmse = torch.sqrt(torch.mean(test_d[:, 0] ** 2)).item()
+    elif is_multi_touch:
+        diff_mt = test_d.view(test_d.size(0), len(touch_pairs), 2)
+        test_per_coord_rmse = {}
+        test_per_coord_mse = {}
+        for idx, (x_key, y_key) in enumerate(touch_pairs):
+            dx = diff_mt[:, idx, 0]
+            dy = diff_mt[:, idx, 1]
+            test_per_coord_rmse[x_key] = torch.sqrt(torch.mean(dx ** 2)).item()
+            test_per_coord_rmse[y_key] = torch.sqrt(torch.mean(dy ** 2)).item()
+            test_per_coord_mse[x_key] = torch.mean(dx ** 2).item()
+            test_per_coord_mse[y_key] = torch.mean(dy ** 2).item()
+        test_mse_all = torch.mean(torch.sum(diff_mt ** 2, dim=2)).item()
+        test_rmse_all = math.sqrt(test_mse_all)
+        test_metrics = {
+            'per_coord_rmse': test_per_coord_rmse,
+            'per_coord_mse': test_per_coord_mse,
+            'rmse_all': test_rmse_all,
+            'mse_all': test_mse_all,
+        }
     else:
         test_per_axis_rmse = torch.sqrt(torch.mean(test_d ** 2, dim=0))
         test_euclid_rmse = torch.sqrt(torch.mean(torch.sum(test_d ** 2, dim=1)))
@@ -507,27 +773,50 @@ def fit(
         print(f"\nTest Set:")
         print(f"  MSE:  {test_mse:.6f}")
         print(f"  RMSE: {test_rmse:.3f} g")
+    elif is_multi_touch:
+        print(f"\nTraining Set:")
+        if final_train_metrics:
+            for coord in sorted(final_train_metrics['per_coord_rmse'].keys()):
+                print(f"  RMSE ({coord}): {final_train_metrics['per_coord_rmse'][coord]:.2f} grid")
+                print(f"  MSE  ({coord}): {final_train_metrics['per_coord_mse'][coord]:.4f} grid^2")
+            print(f"  Overall RMSE: {final_train_metrics['rmse_all']:.2f} grid")
+            print(f"  Overall MSE:  {final_train_metrics['mse_all']:.4f} grid^2")
+
+        print(f"\nValidation Set:")
+        if final_val_metrics:
+            for coord in sorted(final_val_metrics['per_coord_rmse'].keys()):
+                print(f"  RMSE ({coord}): {final_val_metrics['per_coord_rmse'][coord]:.2f} grid")
+                print(f"  MSE  ({coord}): {final_val_metrics['per_coord_mse'][coord]:.4f} grid^2")
+            print(f"  Overall RMSE: {final_val_metrics['rmse_all']:.2f} grid")
+            print(f"  Overall MSE:  {final_val_metrics['mse_all']:.4f} grid^2")
+
+        print(f"\nTest Set:")
+        for coord in sorted(test_metrics['per_coord_rmse'].keys()):
+            print(f"  RMSE ({coord}): {test_metrics['per_coord_rmse'][coord]:.2f} grid")
+            print(f"  MSE  ({coord}): {test_metrics['per_coord_mse'][coord]:.4f} grid^2")
+        print(f"  Overall RMSE: {test_metrics['rmse_all']:.2f} grid")
+        print(f"  Overall MSE:  {test_metrics['mse_all']:.4f} grid^2")
     else:
         print(f"\nTraining Set:")
         print(f"  MSE:       {final_train_mse:.6f}")
-        print(f"  RMSE (X):  {final_train_metrics['rmse_x']:.2f} mm")
-        print(f"  RMSE (Y):  {final_train_metrics['rmse_y']:.2f} mm")
-        print(f"  RMSE (Z):  {final_train_metrics['rmse_z']:.2f} mm")
-        print(f"  RMSE (3D): {final_train_metrics['rmse_euclid']:.2f} mm")
+        print(f"  RMSE (X):  {final_train_metrics['rmse_x']:.2f} grid")
+        print(f"  RMSE (Y):  {final_train_metrics['rmse_y']:.2f} grid")
+        print(f"  RMSE (Z):  {final_train_metrics['rmse_z']:.2f} grid")
+        print(f"  RMSE (3D): {final_train_metrics['rmse_euclid']:.2f} grid")
         
         print(f"\nValidation Set:")
         print(f"  MSE:       {final_val_mse:.6f}")
-        print(f"  RMSE (X):  {final_val_metrics['rmse_x']:.2f} mm")
-        print(f"  RMSE (Y):  {final_val_metrics['rmse_y']:.2f} mm")
-        print(f"  RMSE (Z):  {final_val_metrics['rmse_z']:.2f} mm")
-        print(f"  RMSE (3D): {final_val_metrics['rmse_euclid']:.2f} mm")
+        print(f"  RMSE (X):  {final_val_metrics['rmse_x']:.2f} grid")
+        print(f"  RMSE (Y):  {final_val_metrics['rmse_y']:.2f} grid")
+        print(f"  RMSE (Z):  {final_val_metrics['rmse_z']:.2f} grid")
+        print(f"  RMSE (3D): {final_val_metrics['rmse_euclid']:.2f} grid")
         
         print(f"\nTest Set:")
         print(f"  MSE:       {test_mse:.6f}")
-        print(f"  RMSE (X):  {test_metrics['rmse_x']:.2f} mm")
-        print(f"  RMSE (Y):  {test_metrics['rmse_y']:.2f} mm")
-        print(f"  RMSE (Z):  {test_metrics['rmse_z']:.2f} mm")
-        print(f"  RMSE (3D): {test_metrics['rmse_euclid']:.2f} mm")
+        print(f"  RMSE (X):  {test_metrics['rmse_x']:.2f} grid")
+        print(f"  RMSE (Y):  {test_metrics['rmse_y']:.2f} grid")
+        print(f"  RMSE (Z):  {test_metrics['rmse_z']:.2f} grid")
+        print(f"  RMSE (3D): {test_metrics['rmse_euclid']:.2f} grid")
     
     print("="*60 + "\n")
 
@@ -535,8 +824,8 @@ def fit(
 
 def main():
     parser = argparse.ArgumentParser(description="eFlesh characterization training - LOCALIZATION ONLY")
-    parser.add_argument("--mode", choices=["spatial", "newformat"], default="newformat",
-                        help="Dataset format: 'spatial' (legacy) or 'newformat' (Data/local_sin_3*3/)")
+    parser.add_argument("--mode", choices=["spatial", "newformat", "multi_touch"], default="newformat",
+                        help="Dataset format: 'spatial' (legacy), 'newformat' (position_*.csv), or 'multi_touch'")
     parser.add_argument("--folder", type=str, required=True, 
                         help="Path to dataset: for 'spatial', a probe folder; for 'newformat', directory with position_*.csv")
     parser.add_argument("--epochs", type=int, default=1000)
@@ -546,6 +835,12 @@ def main():
     parser.add_argument("--z_value", type=float, default=0.0, help="Fixed Z value for newformat (2D grid)")
     parser.add_argument("--pattern", type=str, default="position_*.csv", help="File pattern for newformat mode")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--multi_touch_pattern", type=str, default="multi_touch_*.csv",
+                        help="File pattern for multi-touch CSV files")
+    parser.add_argument("--multi_touch_max_touches", type=int, default=None,
+                        help="Limit number of touch pairs loaded (default: load all)")
+    parser.add_argument("--multi_touch_keep_zero", action="store_true",
+                        help="Keep rows where all magnetometer readings are approximately zero")
     
     # Force regression modes are DISABLED by default (moved to unused/)
     parser.add_argument("--enable-force-regression", action="store_true", 
@@ -583,6 +878,7 @@ def main():
         full._data_dir = args.folder
         full._pattern = args.pattern
         full._z_value = args.z_value
+        full._dataset_type = "newformat"
         out_dim = 3
         
     elif args.mode == "spatial":
@@ -601,7 +897,24 @@ def main():
         full._states_csv = states_csv
         full._sensor_csv = sensor_csv
         full._z_thresh = args.z_thresh
+        full._dataset_type = "spatial"
         out_dim = 3
+
+    elif args.mode == "multi_touch":
+        full = MultiTouchSpatialDataset(
+            data_dir=args.folder,
+            pattern=args.multi_touch_pattern,
+            max_touches=args.multi_touch_max_touches,
+            drop_zero_rows=not args.multi_touch_keep_zero,
+            normalize_x=False,
+            normalize_y=False,
+        )
+        full._dataset_type = "multi_touch"
+        full._data_dir = args.folder
+        full._pattern = args.multi_touch_pattern
+        full._max_touches = args.multi_touch_max_touches
+        full._drop_zero_rows = not args.multi_touch_keep_zero
+        out_dim = full.output_dim
 
     print(f"\n{'='*60}")
     print(f"Starting LOCALIZATION training")
