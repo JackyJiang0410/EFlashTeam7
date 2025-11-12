@@ -1,5 +1,7 @@
 # Testing Guide for Localization Training
 
+> **Directory layout:** raw datasets live in `Database/Data/` and training outputs are stored under `Database/result/`.
+
 ## Prerequisites
 
 Before running the training, ensure your Python environment is set up:
@@ -38,25 +40,25 @@ Run a quick test to verify the pipeline works:
 cd /Users/haojiang/Desktop/ECE382N/Project/eFlesh
 
 python characterization/train.py \
-    --folder Data/local_sin_3*3/ \
+    --folder Database/Data/local_sin_3*3/ \
     --epochs 10 \
     --batch_size 32
 ```
 
 **Expected behavior:**
-1. Loads CSV files from `Data/local_sin_3*3/`
+1. Loads CSV files from `Database/Data/local_sin_3*3/`
 2. Prints dataset statistics (number of samples, input/output dimensions)
 3. Shows training progress with RMSE metrics
-4. Saves checkpoint to `Data/local_sin_3*3/artifacts/`
+4. Saves artifacts under `Database/result/localization_single_<timestamp>/`
 
 **Expected output:**
 ```
-Loaded XXXX samples from 9 files in Data/local_sin_3*3/
+Loaded XXXX samples from 9 files in Database/Data/local_sin_3*3/
 
 ============================================================
 Starting LOCALIZATION training
-Mode: newformat
-Dataset: Data/local_sin_3*3/
+Mode: single_touch
+Dataset: Database/Data/local_sin_3*3/
 Samples: XXXX
 Input dim: 15, Output dim: 3
 ============================================================
@@ -64,7 +66,7 @@ Input dim: 15, Output dim: 3
 Training: 100%|████████████| 10/10 [00:XX<00:00, X.XXs/it, RMSE_x=X.XXmm, RMSE_y=X.XXmm, RMSE_z=0.00mm, Net=X.XXmm]
 
 ============================================================
-Model saved to: Data/local_sin_3*3/artifacts/eflesh_localization_newformat_mlp128.pt
+Artifacts saved to: Database/result/localization_single_<timestamp>/
 ============================================================
 ```
 
@@ -76,7 +78,7 @@ For production training, use more epochs:
 
 ```bash
 python characterization/train.py \
-    --folder Data/local_sin_3*3/ \
+    --folder Database/Data/local_sin_3*3/ \
     --epochs 500 \
     --batch_size 64 \
     --lr 1e-3
@@ -89,10 +91,10 @@ python characterization/train.py \
 After training, verify the checkpoint was created:
 
 ```bash
-ls -lh Data/local_sin_3*3/artifacts/
+ls -lh Database/result/
 
-# Should show:
-# eflesh_localization_newformat_mlp128.pt
+# Should show directories like:
+# localization_single_20250101_123456/
 ```
 
 ---
@@ -105,7 +107,8 @@ import numpy as np
 from characterization.model import MLP
 
 # Load checkpoint
-checkpoint = torch.load("Data/local_sin_3*3/artifacts/eflesh_localization_newformat_mlp128.pt")
+run_dir = "Database/result/localization_single_20250101_123456"
+checkpoint = torch.load(f"{run_dir}/checkpoint.pt")
 
 print(f"Mode: {checkpoint['mode']}")
 print(f"Output dim: {checkpoint['out_dim']}")
@@ -138,14 +141,14 @@ print(f"Predicted position: x={position[0]:.2f}, y={position[1]:.2f}, z={positio
 ### Issue: "No files matching position_*.csv found"
 **Solution:** Check that CSV files are in the correct directory:
 ```bash
-ls Data/local_sin_3*3/
+ls Database/Data/local_sin_3*3/
 # Should show: position_1_*.csv, position_2_*.csv, ..., position_9_*.csv
 ```
 
 ### Issue: "KeyError: 'mag0_x'"
 **Solution:** Verify CSV header matches expected format:
 ```bash
-head -1 Data/local_sin_3*3/position_1_*.csv
+head -1 Database/Data/local_sin_3*3/position_1_*.csv
 # Should show: timestamp,position,x_pos,y_pos,fx,fy,fz,tx,ty,tz,mag0_x,mag0_y,mag0_z,...
 ```
 
@@ -162,7 +165,7 @@ head -1 Data/local_sin_3*3/position_1_*.csv
 
 - [x] No syntax errors in `train.py` (verified with linter)
 - [x] `NewFormatSpatialDataset` class created
-- [x] CLI updated with `--mode newformat` default
+- [x] CLI updated with `--mode single_touch` default
 - [x] Force modes disabled/deprecated
 - [ ] Environment set up (conda/pip)
 - [ ] Training completes without errors

@@ -34,18 +34,20 @@ conda activate eflesh
 ## Quickstart (Localization Only)
 
 > **Note:** This repository has been adapted for touch localization. Force regression and slip detection experiments have been moved to `unused/` for reference. See `localization_only.md` for full migration details.
+>
+> **Directory layout:** raw datasets now live under `Database/Data/`, and all training artifacts are written to timestamped folders inside `Database/result/`.
 
 ### Train Localization Model
 
-Train a localization model on your data in `Data/local_sin_3*3/`:
+Train a localization model on your data in `Database/Data/local_sin_3*3/`:
 
 ```bash
 # Basic training (200 epochs)
-python characterization/train.py --folder Data/local_sin_3*3/ --epochs 200
+python characterization/train.py --folder Database/Data/local_sin_3*3/ --epochs 200
 
 # With custom parameters
 python characterization/train.py \
-    --folder Data/local_sin_3*3/ \
+    --folder Database/Data/local_sin_3*3/ \
     --epochs 500 \
     --batch_size 64 \
     --lr 1e-3
@@ -53,17 +55,22 @@ python characterization/train.py \
 
 **Expected Output:**
 ```
-Loaded 1998 samples from 9 files in Data/local_sin_3*3/
+Loaded 1998 samples from 9 files in Database/Data/local_sin_3*3/
 Starting LOCALIZATION training
-Mode: newformat
+Mode: single_touch
 Samples: 1998
 Input dim: 15, Output dim: 3
 ============================================================
 
 Epoch 50/200: RMSE_x: 2.34mm, RMSE_y: 1.87mm, RMSE_z: 0.00mm, Net: 3.01mm
 ...
-Model saved to: Data/local_sin_3*3/artifacts/eflesh_localization_newformat_mlp128.pt
+Artifacts saved to: Database/result/localization_single_20250101_123456
 ```
+
+Inside the run directory you will find:
+
+- `checkpoint.pt` – serialized model weights and normalization stats
+- `summary.txt` – final training/validation/test metrics
 
 ### Data Format
 
@@ -81,15 +88,14 @@ timestamp,position,x_pos,y_pos,fx,fy,fz,tx,ty,tz,mag0_x,mag0_y,mag0_z,mag1_x,...
 
 ```python
 import torch
-from characterization.model import MLP
+# from characterization.model import MLP  # (if using the standalone model definition)
 
-# Load checkpoint
-checkpoint = torch.load("Data/local_sin_3*3/artifacts/eflesh_localization_newformat_mlp128.pt")
-model = MLP(in_dim=15, out_dim=3, hidden=128)
+run_dir = "Database/result/localization_single_20250101_123456"
+checkpoint = torch.load(f"{run_dir}/checkpoint.pt")
+model = MLP(in_dim=15, out_dim=3, hidden=128)  # or import from characterization.models
 model.load_state_dict(checkpoint["state_dict"])
 model.eval()
 
-# Predict position from sensor readings
 sensor_data = torch.tensor([...], dtype=torch.float32)  # 15 magnetometer values
 x_norm = (sensor_data - checkpoint["x_mean"]) / checkpoint["x_std"]
 y_norm = model(x_norm)

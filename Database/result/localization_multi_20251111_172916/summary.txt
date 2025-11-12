@@ -1,0 +1,40 @@
+============================================================
+FINAL TRAINING RESULTS SUMMARY
+============================================================
+
+Training Set:
+  RMSE (pos1_x): 0.06 grid
+  MSE  (pos1_x): 0.0034 grid^2
+  RMSE (pos1_y): 0.05 grid
+  MSE  (pos1_y): 0.0027 grid^2
+  RMSE (pos2_x): 0.05 grid
+  MSE  (pos2_x): 0.0025 grid^2
+  RMSE (pos2_y): 0.04 grid
+  MSE  (pos2_y): 0.0017 grid^2
+  Overall RMSE: 0.07 grid
+  Overall MSE:  0.0052 grid^2
+
+Validation Set:
+  RMSE (pos1_x): 0.10 grid
+  MSE  (pos1_x): 0.0104 grid^2
+  RMSE (pos1_y): 0.08 grid
+  MSE  (pos1_y): 0.0066 grid^2
+  RMSE (pos2_x): 0.07 grid
+  MSE  (pos2_x): 0.0047 grid^2
+  RMSE (pos2_y): 0.06 grid
+  MSE  (pos2_y): 0.0038 grid^2
+  Overall RMSE: 0.11 grid
+  Overall MSE:  0.0128 grid^2
+
+Test Set:
+  RMSE (pos1_x): 0.09 grid
+  MSE  (pos1_x): 0.0080 grid^2
+  RMSE (pos1_y): 0.07 grid
+  MSE  (pos1_y): 0.0047 grid^2
+  RMSE (pos2_x): 0.07 grid
+  MSE  (pos2_x): 0.0045 grid^2
+  RMSE (pos2_y): 0.06 grid
+  MSE  (pos2_y): 0.0034 grid^2
+  Overall RMSE: 0.10 grid
+  Overall MSE:  0.0103 grid^2
+============================================================
