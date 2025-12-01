@@ -101,7 +101,7 @@ class SensorSpatialDataset(torch.utils.data.Dataset):
 class SingleTouchSpatialDataset(torch.utils.data.Dataset):
     """
     Dataset for single-touch CSVs with position_*.csv format (2D grid).
-    Output: [x_pos, y_pos, fz] where fz is the normal force in Newtons.
+    Output: [x_pos, y_pos, abs(fz)] where abs(fz) is the absolute value of normal force in Newtons.
     """
 
     def __init__(
@@ -130,11 +130,12 @@ class SingleTouchSpatialDataset(torch.utils.data.Dataset):
                         x_pos = float(row["x_pos"])
                         y_pos = float(row["y_pos"])
                         # Read fz (force in z direction) for force estimation
+                        # Use absolute value of fz as per requirement
                         try:
-                            fz = float(row["fz"])
+                            fz = abs(float(row["fz"]))  # Use absolute value
                         except (KeyError, ValueError):
                             # Fallback to z_value if fz column doesn't exist
-                            fz = z_value
+                            fz = abs(z_value) if z_value != 0.0 else 0.0
                         
                         mag_readings = [
                             float(row[f"mag{i}_{axis}"])

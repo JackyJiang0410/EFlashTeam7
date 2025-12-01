@@ -1,6 +1,8 @@
 import math
-from typing import Dict, List, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -81,6 +83,71 @@ def _split_indices(n: int, test_split: float) -> Tuple[np.ndarray, np.ndarray, n
     return train_idx, val_idx, test_idx
 
 
+def _plot_training_curves(
+    history: Dict[str, List[float]],
+    output_path: Path,
+    dataset_type: Optional[str] = None,
+) -> None:
+    """Generate and save training curves plot."""
+    epochs = range(1, len(history["train_loss"]) + 1)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Loss plot
+    ax1 = axes[0]
+    ax1.plot(epochs, history["train_loss"], "b-", label="Train Loss", linewidth=2)
+    ax1.plot(epochs, history["val_loss"], "r-", label="Val Loss", linewidth=2)
+    ax1.set_xlabel("Epoch", fontsize=12)
+    ax1.set_ylabel("Loss", fontsize=12)
+    ax1.set_title("Training and Validation Loss", fontsize=14, fontweight="bold")
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale("log")
+    
+    # Metrics plot
+    ax2 = axes[1]
+    if dataset_type == "multi_touch":
+        # For multi-touch, plot overall RMSE
+        if "val_rmse_all" in history:
+            ax2.plot(epochs, history["val_rmse_all"], "g-", label="Val RMSE (Overall)", linewidth=2)
+        if "train_rmse_all" in history:
+            ax2.plot(epochs, history["train_rmse_all"], "b--", label="Train RMSE (Overall)", linewidth=2, alpha=0.7)
+        ax2.set_ylabel("RMSE (grid)", fontsize=12)
+        ax2.set_title("Overall RMSE", fontsize=14, fontweight="bold")
+    elif dataset_type == "single_touch":
+        # For single-touch, plot position RMSE and force RMSE
+        if "val_rmse_euclid" in history:
+            ax2.plot(epochs, history["val_rmse_euclid"], "g-", label="Val RMSE (Euclidean)", linewidth=2)
+        if "train_rmse_euclid" in history:
+            ax2.plot(epochs, history["train_rmse_euclid"], "b--", label="Train RMSE (Euclidean)", linewidth=2, alpha=0.7)
+        if "val_rmse_force" in history:
+            ax2_twin = ax2.twinx()
+            ax2_twin.plot(epochs, history["val_rmse_force"], "orange", label="Val RMSE (Force)", linewidth=2, linestyle="--")
+            if "train_rmse_force" in history:
+                ax2_twin.plot(epochs, history["train_rmse_force"], "purple", label="Train RMSE (Force)", linewidth=2, linestyle=":", alpha=0.7)
+            ax2_twin.set_ylabel("RMSE (Force, N)", fontsize=12, color="orange")
+            ax2_twin.tick_params(axis="y", labelcolor="orange")
+        ax2.set_ylabel("RMSE (grid)", fontsize=12)
+        ax2.set_title("Position & Force RMSE", fontsize=14, fontweight="bold")
+    else:
+        # For spatial or other modes, plot Euclidean RMSE
+        if "val_rmse_euclid" in history:
+            ax2.plot(epochs, history["val_rmse_euclid"], "g-", label="Val RMSE (Euclidean)", linewidth=2)
+        if "train_rmse_euclid" in history:
+            ax2.plot(epochs, history["train_rmse_euclid"], "b--", label="Train RMSE (Euclidean)", linewidth=2, alpha=0.7)
+        ax2.set_ylabel("RMSE (grid)", fontsize=12)
+        ax2.set_title("Euclidean RMSE", fontsize=14, fontweight="bold")
+    
+    ax2.set_xlabel("Epoch", fontsize=12)
+    ax2.legend(fontsize=10, loc="best")
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Training plot saved to: {output_path}")
+
+
 def fit(
     dataset_full,
     out_dim: int,
@@ -90,8 +157,9 @@ def fit(
     device: torch.device,
     seed: int = 0,
     test_split: float = 0.15,
-    force_weight: float = 1.0,
-    use_l1_for_force: bool = False,
+    force_weight: float = 2.0,
+    use_huber_for_force: bool = True,
+    result_dir: Optional[Path] = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -107,8 +175,17 @@ def fit(
     y_mean = dataset_full.Y[train_idx].mean(axis=0)
     y_std = dataset_full.Y[train_idx].std(axis=0)
     y_std = np.where(y_std < 1e-8, 1.0, y_std)
-
+    
     dataset_type = getattr(dataset_full, "_dataset_type", None)
+    
+    # For single_touch mode, improve force normalization
+    # Force typically has different scale than position, so we can normalize it separately
+    if dataset_type == "single_touch" and len(y_mean) >= 3:
+        # Keep position normalization as is, but ensure force std is reasonable
+        # If force std is too small, it might cause issues
+        if y_std[2] < 0.1:  # Force std too small, use a minimum
+            y_std[2] = max(y_std[2], 0.5)  # Ensure minimum std for force
+        print(f"Force normalization: mean={y_mean[2]:.3f} N, std={y_std[2]:.3f} N")
     dataset = _prepare_dataset(dataset_full, dataset_type, x_mean, x_std, y_mean, y_std)
 
     train_loader = torch.utils.data.DataLoader(
@@ -121,27 +198,27 @@ def fit(
         torch.utils.data.Subset(dataset, test_idx), batch_size=batch_size, shuffle=False
     )
 
-    is_multi_touch = dataset_type == "multi_touch"
-    is_single_touch = dataset_type == "single_touch"
-    touch_pairs: List[Tuple[str, str]] = dataset.touch_pairs if is_multi_touch else []
-
     model = MLP(in_dim=dataset.X.shape[1], out_dim=out_dim).to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
     
+    is_multi_touch = dataset_type == "multi_touch"
+    is_single_touch = dataset_type == "single_touch"
+    touch_pairs: List[Tuple[str, str]] = dataset.touch_pairs if is_multi_touch else []
+    
     # For single_touch mode, use weighted loss to emphasize force prediction
-    if is_single_touch and (force_weight != 1.0 or use_l1_for_force):
-        # Create a custom weighted loss
+    if is_single_touch:
         def weighted_loss(pred, target):
-            # pred and target shape: [batch, 3] where [x, y, force]
+            # pred and target shape: [batch, 3] where [x, y, abs(fz)]
             pos_loss = nn.functional.mse_loss(pred[:, :2], target[:, :2])  # x, y (always MSE)
-            if use_l1_for_force:
-                # L1 loss is more robust to outliers in force
-                force_loss = nn.functional.l1_loss(pred[:, 2:3], target[:, 2:3])
+            if use_huber_for_force:
+                # Huber loss is more robust to outliers in force
+                force_loss = nn.functional.huber_loss(pred[:, 2:3], target[:, 2:3], delta=1.0)
             else:
                 force_loss = nn.functional.mse_loss(pred[:, 2:3], target[:, 2:3])
             return pos_loss + force_weight * force_loss
+        
         criterion = weighted_loss
-        loss_type = "L1" if use_l1_for_force else "MSE"
+        loss_type = "Huber" if use_huber_for_force else "MSE"
         print(f"Using weighted loss: position (MSE) weight=1.0, force ({loss_type}) weight={force_weight}")
     else:
         criterion = nn.MSELoss()
@@ -149,6 +226,21 @@ def fit(
     final_train_mse = final_val_mse = None
     final_train_rmse = final_val_rmse = None
     final_train_metrics = final_val_metrics = None
+
+    # History for plotting
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+    }
+    if is_multi_touch:
+        history["val_rmse_all"] = []
+        history["train_rmse_all"] = []
+    else:
+        history["val_rmse_euclid"] = []
+        history["train_rmse_euclid"] = []
+        if is_single_touch:
+            history["val_rmse_force"] = []
+            history["train_rmse_force"] = []
 
     pbar = tqdm(range(1, epochs + 1), desc="Training", ncols=150)
 
@@ -173,6 +265,25 @@ def fit(
             train_all_true.append(yb.cpu())
 
         train_mse = train_loss_sum / max(1, train_count)
+        
+        # Compute train RMSE for plotting (every epoch)
+        train_pred_cat = torch.cat(train_all_pred, dim=0)
+        train_true_cat = torch.cat(train_all_true, dim=0)
+        train_pred_real = torch.from_numpy(dataset.unnormalize_y(train_pred_cat.numpy()))
+        train_true_real = torch.from_numpy(dataset.unnormalize_y(train_true_cat.numpy()))
+        train_diff = train_pred_real - train_true_real
+        
+        if is_multi_touch:
+            train_diff_mt = train_diff.view(train_diff.size(0), len(touch_pairs), 2)
+            train_mse_all = torch.mean(torch.sum(train_diff_mt**2, dim=2)).item()
+            train_rmse_all = math.sqrt(train_mse_all)
+            history["train_rmse_all"].append(train_rmse_all)
+        else:
+            train_euclid_rmse = torch.sqrt(torch.mean(torch.sum(train_diff**2, dim=1)))
+            history["train_rmse_euclid"].append(train_euclid_rmse.item())
+            if is_single_touch:
+                train_per_axis_rmse = torch.sqrt(torch.mean(train_diff**2, dim=0))
+                history["train_rmse_force"].append(train_per_axis_rmse[2].item())
 
         model.eval()
         val_loss_sum = val_count = 0.0
@@ -198,6 +309,10 @@ def fit(
         pred_real = torch.from_numpy(dataset.unnormalize_y(pred.numpy()))
         true_real = torch.from_numpy(dataset.unnormalize_y(true.numpy()))
         diff = pred_real - true_real
+
+        # Record history
+        history["train_loss"].append(train_mse)
+        history["val_loss"].append(val_mse)
 
         if out_dim == 1:
             rmse = torch.sqrt(torch.mean(diff[:, 0] ** 2)).item()
@@ -226,6 +341,9 @@ def fit(
             postfix = {f"RMSE_{coord}": f"{per_coord_rmse[coord]:.2f} grid" for coord in per_coord_rmse}
             postfix["RMSE_all"] = f"{rmse_all:.2f} grid"
             pbar.set_postfix(postfix)
+            
+            # Record history
+            history["val_rmse_all"].append(rmse_all)
 
             final_train_mse = train_mse
             final_val_mse = val_mse
@@ -253,6 +371,9 @@ def fit(
                         "Net": f"{euclid_rmse:.2f}",
                     }
                 )
+                # Record history
+                history["val_rmse_euclid"].append(euclid_rmse.item())
+                history["val_rmse_force"].append(rthird)
             else:
                 pbar.set_postfix(
                     {
@@ -262,6 +383,8 @@ def fit(
                         "Net": f"{euclid_rmse:.2f} grid",
                     }
                 )
+                # Record history
+                history["val_rmse_euclid"].append(euclid_rmse.item())
             final_train_mse = train_mse
             final_val_mse = val_mse
             if is_single_touch:
@@ -484,6 +607,11 @@ def fit(
 
     for line in summary_lines:
         print(line)
+
+    # Generate and save training plot
+    if result_dir is not None:
+        plot_path = result_dir / "training_curves.png"
+        _plot_training_curves(history, plot_path, dataset_type=dataset_type)
 
     return model, (x_mean, x_std, y_mean, y_std), summary_text
 

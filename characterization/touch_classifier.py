@@ -3,8 +3,9 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple
+from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -73,6 +74,43 @@ def split_indices(n: int, test_split: float = 0.15, val_ratio: float = 0.2) -> T
     return train_idx, val_idx, test_idx
 
 
+def _plot_classifier_curves(
+    history: Dict[str, List[float]],
+    output_path: Path,
+) -> None:
+    """Generate and save training curves plot for classifier."""
+    epochs = range(1, len(history["train_loss"]) + 1)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Loss plot
+    ax1 = axes[0]
+    ax1.plot(epochs, history["train_loss"], "b-", label="Train Loss", linewidth=2)
+    ax1.plot(epochs, history["val_loss"], "r-", label="Val Loss", linewidth=2)
+    ax1.set_xlabel("Epoch", fontsize=12)
+    ax1.set_ylabel("Loss (BCE)", fontsize=12)
+    ax1.set_title("Training and Validation Loss", fontsize=14, fontweight="bold")
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale("log")
+    
+    # Accuracy plot
+    ax2 = axes[1]
+    ax2.plot(epochs, history["train_acc"], "b-", label="Train Accuracy", linewidth=2)
+    ax2.plot(epochs, history["val_acc"], "r-", label="Val Accuracy", linewidth=2)
+    ax2.set_xlabel("Epoch", fontsize=12)
+    ax2.set_ylabel("Accuracy", fontsize=12)
+    ax2.set_title("Training and Validation Accuracy", fontsize=14, fontweight="bold")
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim([0, 1.05])
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"Training plot saved to: {output_path}")
+
+
 def fit_touch_classifier(
     dataset_full: TouchClassificationDataset,
     epochs: int,
@@ -81,6 +119,7 @@ def fit_touch_classifier(
     device: torch.device,
     seed: int = 0,
     test_split: float = 0.15,
+    result_dir: Optional[Path] = None,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -126,6 +165,14 @@ def fit_touch_classifier(
     best_val_acc = 0.0
     best_state = None
 
+    # History for plotting
+    history: Dict[str, List[float]] = {
+        "train_loss": [],
+        "val_loss": [],
+        "train_acc": [],
+        "val_acc": [],
+    }
+
     pbar = tqdm(range(1, epochs + 1), desc="Training classifier", ncols=150)
     for epoch in pbar:
         model.train()
@@ -169,6 +216,12 @@ def fit_touch_classifier(
 
         val_loss = val_loss_sum / max(1, val_total)
         val_acc = val_correct / max(1, val_total)
+
+        # Record history
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
 
         if val_acc >= best_val_acc:
             best_val_acc = val_acc
@@ -227,6 +280,11 @@ def fit_touch_classifier(
         print(line)
 
     summary_text = "\n".join(summary_lines)
+
+    # Generate and save training plot
+    if result_dir is not None:
+        plot_path = result_dir / "training_curves.png"
+        _plot_classifier_curves(history, plot_path)
 
     return model, (x_mean.astype(np.float32), x_std.astype(np.float32)), test_acc, summary_text
 
@@ -319,6 +377,12 @@ def main():
     print(f"Input dim: {dataset_full.X.shape[1]}")
     print(f"{'=' * 60}\n")
 
+    base_result_dir = Path(args.output_dir).expanduser() if args.output_dir else BASE_RESULT_DIR
+    base_result_dir.mkdir(parents=True, exist_ok=True)
+    run_label = "classifier_single_multi"
+    run_dir = base_result_dir / f"{run_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
     model, stats, test_acc, summary_text = fit_touch_classifier(
         dataset_full=dataset_full,
         epochs=args.epochs,
@@ -327,13 +391,8 @@ def main():
         device=device,
         seed=args.seed,
         test_split=args.test_split,
+        result_dir=run_dir,
     )
-
-    base_result_dir = Path(args.output_dir).expanduser() if args.output_dir else BASE_RESULT_DIR
-    base_result_dir.mkdir(parents=True, exist_ok=True)
-    run_label = "classifier_single_multi"
-    run_dir = base_result_dir / f"{run_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_path = run_dir / "checkpoint.pt"
 
