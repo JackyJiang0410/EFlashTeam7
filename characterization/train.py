@@ -158,6 +158,19 @@ def parse_args():
     parser.add_argument("--z_thresh", type=float, default=145.1)
     parser.add_argument("--z_value", type=float, default=0.0)
 
+    # single_touch force estimation options
+    parser.add_argument(
+        "--force_weight",
+        type=float,
+        default=5.0,
+        help="Weight for force loss in single_touch mode (default: 5.0). Higher values emphasize force prediction.",
+    )
+    parser.add_argument(
+        "--use_l1_for_force",
+        action="store_true",
+        help="Use L1 loss for force (more robust to outliers) instead of MSE in single_touch mode.",
+    )
+
     # multi-touch options
     parser.add_argument("--multi_touch_pattern", type=str, default="multi_touch_*.csv")
     parser.add_argument("--multi_touch_max_touches", type=int, default=None)
@@ -205,13 +218,15 @@ def main():
         lr=args.lr,
         device=device,
         seed=args.seed,
+        force_weight=args.force_weight if args.mode == "single_touch" else 1.0,
+        use_l1_for_force=args.use_l1_for_force if args.mode == "single_touch" else False,
     )
 
     BASE_RESULT_DIR.mkdir(parents=True, exist_ok=True)
     run_label = "localization_multi" if args.mode == "multi_touch" else "localization_single"
     run_dir = BASE_RESULT_DIR / f"{run_label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
-
+    
     checkpoint_path = run_dir / "checkpoint.pt"
     torch.save(
         {

@@ -116,8 +116,11 @@ def fit_touch_classifier(
         torch.utils.data.Subset(dataset, test_idx), batch_size=batch_size, shuffle=False
     )
 
-    model = MLP(in_dim=dataset.X.shape[1], out_dim=2, hidden=128).to(device)
-    criterion = nn.CrossEntropyLoss()
+    # Model outputs a single logit value:
+    # - After sigmoid: < 0.5 = single-touch (class 0), >= 0.5 = multi-touch (class 1)
+    # - Direct logit: < 0 = single-touch, >= 0 = multi-touch
+    model = MLP(in_dim=dataset.X.shape[1], out_dim=1, hidden=128).to(device)
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     best_val_acc = 0.0
@@ -132,17 +135,17 @@ def fit_touch_classifier(
 
         for xb, yb in train_loader:
             xb = xb.float().to(device)
-            yb = yb.long().to(device)
+            yb = yb.float().to(device)  # BCE expects float targets
 
             optimizer.zero_grad()
-            logits = model(xb)
+            logits = model(xb).squeeze(1)  # Remove extra dimension: [batch, 1] -> [batch]
             loss = criterion(logits, yb)
             loss.backward()
             optimizer.step()
 
             train_loss_sum += loss.item() * xb.size(0)
-            preds = torch.argmax(logits, dim=1)
-            train_correct += (preds == yb).sum().item()
+            preds = (torch.sigmoid(logits) >= 0.5).long()  # Single output: >= 0.5 = multi-touch (1)
+            train_correct += (preds == yb.long()).sum().item()
             train_total += xb.size(0)
 
         train_loss = train_loss_sum / max(1, train_total)
@@ -156,12 +159,12 @@ def fit_touch_classifier(
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb = xb.float().to(device)
-                yb = yb.long().to(device)
-                logits = model(xb)
+                yb = yb.float().to(device)  # BCE expects float targets
+                logits = model(xb).squeeze(1)  # Remove extra dimension: [batch, 1] -> [batch]
                 loss = criterion(logits, yb)
                 val_loss_sum += loss.item() * xb.size(0)
-                preds = torch.argmax(logits, dim=1)
-                val_correct += (preds == yb).sum().item()
+                preds = (torch.sigmoid(logits) >= 0.5).long()  # Single output: >= 0.5 = multi-touch (1)
+                val_correct += (preds == yb.long()).sum().item()
                 val_total += xb.size(0)
 
         val_loss = val_loss_sum / max(1, val_total)
@@ -187,17 +190,17 @@ def fit_touch_classifier(
     test_loss_sum = 0.0
     test_correct = 0
     test_total = 0
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
 
     with torch.no_grad():
         for xb, yb in test_loader:
             xb = xb.float().to(device)
-            yb = yb.long().to(device)
-            logits = model(xb)
+            yb = yb.float().to(device)  # BCE expects float targets
+            logits = model(xb).squeeze(1)  # Remove extra dimension: [batch, 1] -> [batch]
             loss = criterion(logits, yb)
             test_loss_sum += loss.item() * xb.size(0)
-            preds = torch.argmax(logits, dim=1)
-            test_correct += (preds == yb).sum().item()
+            preds = (torch.sigmoid(logits) >= 0.5).long()  # Single output: >= 0.5 = multi-touch (1)
+            test_correct += (preds == yb.long()).sum().item()
             test_total += xb.size(0)
 
     test_loss = test_loss_sum / max(1, test_total)

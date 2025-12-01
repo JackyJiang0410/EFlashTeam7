@@ -101,6 +101,7 @@ class SensorSpatialDataset(torch.utils.data.Dataset):
 class SingleTouchSpatialDataset(torch.utils.data.Dataset):
     """
     Dataset for single-touch CSVs with position_*.csv format (2D grid).
+    Output: [x_pos, y_pos, fz] where fz is the normal force in Newtons.
     """
 
     def __init__(
@@ -113,7 +114,7 @@ class SingleTouchSpatialDataset(torch.utils.data.Dataset):
         y_std=None,
         normalize_x: bool = True,
         normalize_y: bool = True,
-        z_value: float = 0.0,
+        z_value: float = 0.0,  # Deprecated: kept for backward compatibility, but fz is used instead
     ):
         csv_files = sorted(Path(data_dir).glob(pattern))
         if not csv_files:
@@ -128,6 +129,13 @@ class SingleTouchSpatialDataset(torch.utils.data.Dataset):
                     try:
                         x_pos = float(row["x_pos"])
                         y_pos = float(row["y_pos"])
+                        # Read fz (force in z direction) for force estimation
+                        try:
+                            fz = float(row["fz"])
+                        except (KeyError, ValueError):
+                            # Fallback to z_value if fz column doesn't exist
+                            fz = z_value
+                        
                         mag_readings = [
                             float(row[f"mag{i}_{axis}"])
                             for i in range(5)
@@ -140,7 +148,7 @@ class SingleTouchSpatialDataset(torch.utils.data.Dataset):
                         continue
 
                     all_sensors.append(mag_readings)
-                    all_positions.append([x_pos, y_pos, z_value])
+                    all_positions.append([x_pos, y_pos, fz])
 
         if not all_sensors:
             raise ValueError(f"No valid data found in {data_dir}")

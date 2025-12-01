@@ -90,6 +90,8 @@ def fit(
     device: torch.device,
     seed: int = 0,
     test_split: float = 0.15,
+    force_weight: float = 1.0,
+    use_l1_for_force: bool = False,
 ):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -119,16 +121,34 @@ def fit(
         torch.utils.data.Subset(dataset, test_idx), batch_size=batch_size, shuffle=False
     )
 
+    is_multi_touch = dataset_type == "multi_touch"
+    is_single_touch = dataset_type == "single_touch"
+    touch_pairs: List[Tuple[str, str]] = dataset.touch_pairs if is_multi_touch else []
+
     model = MLP(in_dim=dataset.X.shape[1], out_dim=out_dim).to(device)
     opt = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    
+    # For single_touch mode, use weighted loss to emphasize force prediction
+    if is_single_touch and (force_weight != 1.0 or use_l1_for_force):
+        # Create a custom weighted loss
+        def weighted_loss(pred, target):
+            # pred and target shape: [batch, 3] where [x, y, force]
+            pos_loss = nn.functional.mse_loss(pred[:, :2], target[:, :2])  # x, y (always MSE)
+            if use_l1_for_force:
+                # L1 loss is more robust to outliers in force
+                force_loss = nn.functional.l1_loss(pred[:, 2:3], target[:, 2:3])
+            else:
+                force_loss = nn.functional.mse_loss(pred[:, 2:3], target[:, 2:3])
+            return pos_loss + force_weight * force_loss
+        criterion = weighted_loss
+        loss_type = "L1" if use_l1_for_force else "MSE"
+        print(f"Using weighted loss: position (MSE) weight=1.0, force ({loss_type}) weight={force_weight}")
+    else:
+        criterion = nn.MSELoss()
 
     final_train_mse = final_val_mse = None
     final_train_rmse = final_val_rmse = None
     final_train_metrics = final_val_metrics = None
-
-    is_multi_touch = dataset_type == "multi_touch"
-    touch_pairs: List[Tuple[str, str]] = dataset.touch_pairs if is_multi_touch else []
 
     pbar = tqdm(range(1, epochs + 1), desc="Training", ncols=150)
 
@@ -218,27 +238,46 @@ def fit(
         else:
             per_axis_rmse = torch.sqrt(torch.mean(diff**2, dim=0))
             euclid_rmse = torch.sqrt(torch.mean(torch.sum(diff**2, dim=1)))
-            rx, ry, rz = (
+            rx, ry, rthird = (
                 per_axis_rmse[0].item(),
                 per_axis_rmse[1].item(),
                 per_axis_rmse[2].item(),
             )
-            pbar.set_postfix(
-                {
-                    "RMSE_x": f"{rx:.2f} grid",
-                    "RMSE_y": f"{ry:.2f} grid",
-                    "RMSE_z": f"{rz:.2f} grid",
-                    "Net": f"{euclid_rmse:.2f} grid",
-                }
-            )
+            # For single_touch mode, 3rd dimension is force (N), otherwise it's z (grid)
+            if is_single_touch:
+                pbar.set_postfix(
+                    {
+                        "RMSE_x": f"{rx:.2f} grid",
+                        "RMSE_y": f"{ry:.2f} grid",
+                        "RMSE_force": f"{rthird:.3f} N",
+                        "Net": f"{euclid_rmse:.2f}",
+                    }
+                )
+            else:
+                pbar.set_postfix(
+                    {
+                        "RMSE_x": f"{rx:.2f} grid",
+                        "RMSE_y": f"{ry:.2f} grid",
+                        "RMSE_z": f"{rthird:.2f} grid",
+                        "Net": f"{euclid_rmse:.2f} grid",
+                    }
+                )
             final_train_mse = train_mse
             final_val_mse = val_mse
-            final_val_metrics = {
-                "rmse_x": rx,
-                "rmse_y": ry,
-                "rmse_z": rz,
-                "rmse_euclid": euclid_rmse.item(),
-            }
+            if is_single_touch:
+                final_val_metrics = {
+                    "rmse_x": rx,
+                    "rmse_y": ry,
+                    "rmse_force": rthird,
+                    "rmse_euclid": euclid_rmse.item(),
+                }
+            else:
+                final_val_metrics = {
+                    "rmse_x": rx,
+                    "rmse_y": ry,
+                    "rmse_z": rthird,
+                    "rmse_euclid": euclid_rmse.item(),
+                }
 
         if epoch == epochs:
             train_pred_cat = torch.cat(train_all_pred, dim=0)
@@ -271,12 +310,20 @@ def fit(
             else:
                 train_per_axis_rmse = torch.sqrt(torch.mean(train_diff**2, dim=0))
                 train_euclid_rmse = torch.sqrt(torch.mean(torch.sum(train_diff**2, dim=1)))
-                final_train_metrics = {
-                    "rmse_x": train_per_axis_rmse[0].item(),
-                    "rmse_y": train_per_axis_rmse[1].item(),
-                    "rmse_z": train_per_axis_rmse[2].item(),
-                    "rmse_euclid": train_euclid_rmse.item(),
-                }
+                if is_single_touch:
+                    final_train_metrics = {
+                        "rmse_x": train_per_axis_rmse[0].item(),
+                        "rmse_y": train_per_axis_rmse[1].item(),
+                        "rmse_force": train_per_axis_rmse[2].item(),
+                        "rmse_euclid": train_euclid_rmse.item(),
+                    }
+                else:
+                    final_train_metrics = {
+                        "rmse_x": train_per_axis_rmse[0].item(),
+                        "rmse_y": train_per_axis_rmse[1].item(),
+                        "rmse_z": train_per_axis_rmse[2].item(),
+                        "rmse_euclid": train_euclid_rmse.item(),
+                    }
 
     print("\n" + "=" * 60)
     print("Evaluating on TEST set...")
@@ -329,12 +376,20 @@ def fit(
     else:
         test_per_axis_rmse = torch.sqrt(torch.mean(test_diff**2, dim=0))
         test_euclid_rmse = torch.sqrt(torch.mean(torch.sum(test_diff**2, dim=1)))
-        test_metrics = {
-            "rmse_x": test_per_axis_rmse[0].item(),
-            "rmse_y": test_per_axis_rmse[1].item(),
-            "rmse_z": test_per_axis_rmse[2].item(),
-            "rmse_euclid": test_euclid_rmse.item(),
-        }
+        if is_single_touch:
+            test_metrics = {
+                "rmse_x": test_per_axis_rmse[0].item(),
+                "rmse_y": test_per_axis_rmse[1].item(),
+                "rmse_force": test_per_axis_rmse[2].item(),
+                "rmse_euclid": test_euclid_rmse.item(),
+            }
+        else:
+            test_metrics = {
+                "rmse_x": test_per_axis_rmse[0].item(),
+                "rmse_y": test_per_axis_rmse[1].item(),
+                "rmse_z": test_per_axis_rmse[2].item(),
+                "rmse_euclid": test_euclid_rmse.item(),
+            }
 
     summary_lines: List[str] = []
 
@@ -379,26 +434,49 @@ def fit(
         add_line(f"  Overall RMSE: {test_metrics['rmse_all']:.2f} grid")
         add_line(f"  Overall MSE:  {test_metrics['mse_all']:.4f} grid^2")
     else:
-        add_line("\nTraining Set:")
-        add_line(f"  MSE:       {final_train_mse:.6f}")
-        add_line(f"  RMSE (X):  {final_train_metrics['rmse_x']:.2f} grid")
-        add_line(f"  RMSE (Y):  {final_train_metrics['rmse_y']:.2f} grid")
-        add_line(f"  RMSE (Z):  {final_train_metrics['rmse_z']:.2f} grid")
-        add_line(f"  RMSE (3D): {final_train_metrics['rmse_euclid']:.2f} grid")
+        # For single_touch mode, 3rd dimension is force (N), otherwise it's z (grid)
+        if is_single_touch:
+            add_line("\nTraining Set:")
+            add_line(f"  MSE:        {final_train_mse:.6f}")
+            add_line(f"  RMSE (X):   {final_train_metrics['rmse_x']:.2f} grid")
+            add_line(f"  RMSE (Y):   {final_train_metrics['rmse_y']:.2f} grid")
+            add_line(f"  RMSE (Force): {final_train_metrics['rmse_force']:.3f} N")
+            add_line(f"  RMSE (3D):  {final_train_metrics['rmse_euclid']:.2f}")
 
-        add_line("\nValidation Set:")
-        add_line(f"  MSE:       {final_val_mse:.6f}")
-        add_line(f"  RMSE (X):  {final_val_metrics['rmse_x']:.2f} grid")
-        add_line(f"  RMSE (Y):  {final_val_metrics['rmse_y']:.2f} grid")
-        add_line(f"  RMSE (Z):  {final_val_metrics['rmse_z']:.2f} grid")
-        add_line(f"  RMSE (3D): {final_val_metrics['rmse_euclid']:.2f} grid")
+            add_line("\nValidation Set:")
+            add_line(f"  MSE:        {final_val_mse:.6f}")
+            add_line(f"  RMSE (X):   {final_val_metrics['rmse_x']:.2f} grid")
+            add_line(f"  RMSE (Y):   {final_val_metrics['rmse_y']:.2f} grid")
+            add_line(f"  RMSE (Force): {final_val_metrics['rmse_force']:.3f} N")
+            add_line(f"  RMSE (3D):  {final_val_metrics['rmse_euclid']:.2f}")
 
-        add_line("\nTest Set:")
-        add_line(f"  MSE:       {test_mse:.6f}")
-        add_line(f"  RMSE (X):  {test_metrics['rmse_x']:.2f} grid")
-        add_line(f"  RMSE (Y):  {test_metrics['rmse_y']:.2f} grid")
-        add_line(f"  RMSE (Z):  {test_metrics['rmse_z']:.2f} grid")
-        add_line(f"  RMSE (3D): {test_metrics['rmse_euclid']:.2f} grid")
+            add_line("\nTest Set:")
+            add_line(f"  MSE:        {test_mse:.6f}")
+            add_line(f"  RMSE (X):   {test_metrics['rmse_x']:.2f} grid")
+            add_line(f"  RMSE (Y):   {test_metrics['rmse_y']:.2f} grid")
+            add_line(f"  RMSE (Force): {test_metrics['rmse_force']:.3f} N")
+            add_line(f"  RMSE (3D):  {test_metrics['rmse_euclid']:.2f}")
+        else:
+            add_line("\nTraining Set:")
+            add_line(f"  MSE:       {final_train_mse:.6f}")
+            add_line(f"  RMSE (X):  {final_train_metrics['rmse_x']:.2f} grid")
+            add_line(f"  RMSE (Y):  {final_train_metrics['rmse_y']:.2f} grid")
+            add_line(f"  RMSE (Z):  {final_train_metrics['rmse_z']:.2f} grid")
+            add_line(f"  RMSE (3D): {final_train_metrics['rmse_euclid']:.2f} grid")
+
+            add_line("\nValidation Set:")
+            add_line(f"  MSE:       {final_val_mse:.6f}")
+            add_line(f"  RMSE (X):  {final_val_metrics['rmse_x']:.2f} grid")
+            add_line(f"  RMSE (Y):  {final_val_metrics['rmse_y']:.2f} grid")
+            add_line(f"  RMSE (Z):  {final_val_metrics['rmse_z']:.2f} grid")
+            add_line(f"  RMSE (3D): {final_val_metrics['rmse_euclid']:.2f} grid")
+
+            add_line("\nTest Set:")
+            add_line(f"  MSE:       {test_mse:.6f}")
+            add_line(f"  RMSE (X):  {test_metrics['rmse_x']:.2f} grid")
+            add_line(f"  RMSE (Y):  {test_metrics['rmse_y']:.2f} grid")
+            add_line(f"  RMSE (Z):  {test_metrics['rmse_z']:.2f} grid")
+            add_line(f"  RMSE (3D): {test_metrics['rmse_euclid']:.2f} grid")
 
     add_line("=" * 60 + "\n")
 

@@ -1,0 +1,25 @@
+============================================================
+FINAL TRAINING RESULTS SUMMARY
+============================================================
+
+Training Set:
+  MSE:        0.001787
+  RMSE (X):   0.03 grid
+  RMSE (Y):   0.03 grid
+  RMSE (Force): 0.232 N
+  RMSE (3D):  0.23
+
+Validation Set:
+  MSE:        0.003661
+  RMSE (X):   0.03 grid
+  RMSE (Y):   0.06 grid
+  RMSE (Force): 0.280 N
+  RMSE (3D):  0.29
+
+Test Set:
+  MSE:        0.002705
+  RMSE (X):   0.03 grid
+  RMSE (Y):   0.03 grid
+  RMSE (Force): 0.306 N
+  RMSE (3D):  0.31
+============================================================
